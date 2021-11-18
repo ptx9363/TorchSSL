@@ -7,6 +7,7 @@ import torchvision
 from PIL import Image
 import numpy as np
 import copy
+from multiprocessing import Manager
 
 
 class BasicDataset(Dataset):
@@ -39,7 +40,8 @@ class BasicDataset(Dataset):
         """
         super(BasicDataset, self).__init__()
         self.alg = alg
-        self.data = data
+        manager = Manager()
+        self.data = manager.list([sample for sample in data])
         self.targets = targets
 
         self.num_classes = num_classes
@@ -61,7 +63,6 @@ class BasicDataset(Dataset):
         else:
             return weak_augment_image, strong_augment_image, target
         """
-
         # set idx-th target
         if self.targets is None:
             target = None
@@ -70,7 +71,6 @@ class BasicDataset(Dataset):
             target = target_ if not self.onehot else get_onehot(self.num_classes, target_)
 
         # set augmented images
-
         img = self.data[idx]
         if self.transform is None:
             return transforms.ToTensor()(img), target

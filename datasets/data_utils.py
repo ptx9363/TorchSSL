@@ -1,17 +1,24 @@
+import os
+import numpy as np
+import json
 import torch
 import torchvision
 from torchvision import datasets
 from torch.utils.data import sampler, DataLoader
-from torch.utils.data.sampler import BatchSampler
+
+from torch.utils.data import DistributedSampler
+from torch.utils.data.sampler import BatchSampler, RandomSampler
 import torch.distributed as dist
-import numpy as np
-import json
-import os
 
 from datasets.DistributedProxySampler import DistributedProxySampler
 
-
-def split_ssl_data(args, data, target, num_labels, num_classes, index=None, include_lb_to_ulb=True):
+def split_ssl_data(args,
+                   data,
+                   target,
+                   num_labels,
+                   num_classes,
+                   index=None,
+                   include_lb_to_ulb=True):
     """
     data & target is splitted into labeled and unlabeld data.
     
@@ -20,17 +27,24 @@ def split_ssl_data(args, data, target, num_labels, num_classes, index=None, incl
         include_lb_to_ulb: If True, labeled data is also included in unlabeld data
     """
     data, target = np.array(data), np.array(target)
-    lb_data, lbs, lb_idx, = sample_labeled_data(args, data, target, num_labels, num_classes, index)
-    ulb_idx = np.array(sorted(list(set(range(len(data))) - set(lb_idx))))  # unlabeled_data index of data
+    lb_data, lbs, lb_idx, = sample_labeled_data(args, data, target, num_labels,
+                                                num_classes, index)
+    ulb_idx = np.array(sorted(
+        list(set(range(len(data))) -
+             set(lb_idx))))  # unlabeled_data index of data
     if include_lb_to_ulb:
         return lb_data, lbs, data, target
     else:
         return lb_data, lbs, data[ulb_idx], target[ulb_idx]
 
 
-def sample_labeled_data(args, data, target,
-                        num_labels, num_classes,
-                        index=None, name=None):
+def sample_labeled_data(args,
+                        data,
+                        target,
+                        num_labels,
+                        num_classes,
+                        index=None,
+                        name=None):
     '''
     samples for labeled data
     (sampling with balanced ratio over classes)
@@ -40,7 +54,8 @@ def sample_labeled_data(args, data, target,
         index = np.array(index, dtype=np.int32)
         return data[index], target[index], index
 
-    dump_path = os.path.join(args.save_dir, args.save_name, 'sampled_label_idx.npy')
+    dump_path = os.path.join(args.save_dir, args.save_name,
+                             'sampled_label_idx.npy')
 
     if os.path.exists(dump_path):
         lb_idx = np.load(dump_path)
@@ -70,8 +85,9 @@ def get_sampler_by_name(name):
     '''
     get sampler in torch.utils.data.sampler by name
     '''
-    sampler_name_list = sorted(name for name in torch.utils.data.sampler.__dict__
-                               if not name.startswith('_') and callable(sampler.__dict__[name]))
+    sampler_name_list = sorted(
+        name for name in torch.utils.data.sampler.__dict__
+        if not name.startswith('_') and callable(sampler.__dict__[name]))
     try:
         if name == 'DistributedSampler':
             return torch.utils.data.distributed.DistributedSampler
@@ -93,7 +109,8 @@ def get_data_loader(dset,
                     num_iters=None,
                     generator=None,
                     drop_last=True,
-                    distributed=False):
+                    distributed=False,
+                    rank=None):
     """
     get_data_loader returns torch.utils.data.DataLoader for a Dataset.
     All arguments are comparable with those of pytorch DataLoader.
@@ -107,8 +124,11 @@ def get_data_loader(dset,
     assert batch_size is not None
 
     if data_sampler is None:
-        return DataLoader(dset, batch_size=batch_size, shuffle=shuffle,
-                          num_workers=num_workers, pin_memory=pin_memory)
+        return DataLoader(dset,
+                          batch_size=batch_size,
+                          shuffle=shuffle,
+                          num_workers=num_workers,
+                          pin_memory=pin_memory)
 
     else:
         if isinstance(data_sampler, str):
@@ -121,27 +141,27 @@ def get_data_loader(dset,
             num_replicas = 1
 
         if (num_epochs is not None) and (num_iters is None):
-            num_samples = len(dset) * num_epochs
+            total_size = len(dset) * num_epochs
         elif (num_epochs is None) and (num_iters is not None):
-            num_samples = batch_size * num_iters * num_replicas
+            total_size = batch_size * num_iters * num_replicas
         else:
-            num_samples = len(dset)
+            total_size = len(dset)
 
-        if data_sampler.__name__ == 'RandomSampler':
-            data_sampler = data_sampler(dset, replacement, num_samples, generator)
+        if not distributed:
+            # [TODO] check non-distributed training
+            data_sampler = RandomSampler(dset,
+                                         replacement=True,
+                                         num_samples=total_size)
         else:
-            raise RuntimeError(f"{data_sampler.__name__} is not implemented.")
+            data_sampler = DistributedSampler(dset,
+                                            num_replicas=num_replicas,
+                                            rank=rank)
 
-        if distributed:
-            '''
-            Different with DistributedSampler, 
-            the DistribuedProxySampler does not shuffle the data (just wrapper for dist).
-            '''
-            data_sampler = DistributedProxySampler(data_sampler)
-
-        batch_sampler = BatchSampler(data_sampler, batch_size, drop_last)
-        return DataLoader(dset, batch_sampler=batch_sampler,
-                          num_workers=num_workers, pin_memory=pin_memory)
+        return DataLoader(dset,
+                          sampler=data_sampler,
+                          batch_size=batch_size,
+                          num_workers=num_workers,
+                          persistent_workers=True)
 
 
 def get_onehot(num_classes, idx):

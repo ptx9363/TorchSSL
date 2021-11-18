@@ -1,6 +1,7 @@
 # copyright: https://github.com/pytorch/pytorch/issues/23430#issuecomment-562350407
 
 import math
+from typing import Optional
 import torch
 from torch.utils.data.distributed import DistributedSampler
 
@@ -23,23 +24,35 @@ class DistributedProxySampler(DistributedSampler):
         rank (optional): Rank of the current process within num_replicas.
     """
 
-    def __init__(self, sampler, num_replicas=None, rank=None):        
-        super(DistributedProxySampler, self).__init__(sampler, num_replicas=num_replicas, rank=rank, shuffle=False)
-        self.sampler = sampler
+    def __init__(self, dataset, num_replicas=None, rank=None):
+        super().__init__(dataset,
+                         num_replicas=num_replicas,
+                         rank=rank,
+                         shuffle=False)
+
+        dataset_size = max(len(self.dataset), 1024)  # minimal 1024 samples, reduce frequence of the Iterator reset 
+        # dataset_size = len(self.dataset)
+        
+        self.num_samples = math.ceil(dataset_size / self.num_replicas)
+        self.total_size = self.num_samples * self.num_replicas
 
     def __iter__(self):
-        # deterministically shuffle based on epoch
         torch.manual_seed(self.epoch)
-        indices = list(self.sampler)
+        n = len(self.dataset)
 
-        # add extra samples to make it evenly divisible
-        indices += indices[:(self.total_size - len(indices))]
-        if len(indices) != self.total_size:
-            raise RuntimeError("{} vs {}".format(len(indices), self.total_size))
+        if self.total_size > n:
+            indices = list(
+                iter(
+                    torch.randint(high=n,
+                                  size=(self.total_size,),
+                                  dtype=torch.int64).tolist()))
+        else:
+            indices = list(iter(torch.randperm(n).tolist()))[:self.total_size]
+
+        assert len(indices) == self.total_size
 
         # subsample
         indices = indices[self.rank:self.total_size:self.num_replicas]
-        if len(indices) != self.num_samples:
-            raise RuntimeError("{} vs {}".format(len(indices), self.num_samples))
+        assert len(indices) == self.num_samples
 
         return iter(indices)

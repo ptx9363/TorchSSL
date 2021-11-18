@@ -17,6 +17,7 @@ from train_utils import ce_loss, wd_loss, EMA, Bn_Controller
 
 from sklearn.metrics import *
 from copy import deepcopy
+import pdb
 
 
 class FlexMatch:
@@ -80,9 +81,8 @@ class FlexMatch:
         self.scheduler = scheduler
 
     def train(self, args, logger=None):
-
         ngpus_per_node = torch.cuda.device_count()
-
+        
         # EMA Init
         self.model.train()
         self.ema = EMA(self.model, self.ema_m)
@@ -130,7 +130,7 @@ class FlexMatch:
             # prevent the training iterations exceed args.num_train_iter
             if self.it > args.num_train_iter:
                 break
-
+            
             end_batch.record()
             torch.cuda.synchronize()
             start_run.record()

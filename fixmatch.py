@@ -3,6 +3,7 @@ import os
 import logging
 import random
 import warnings
+import time
 
 import numpy as np
 import torch
@@ -18,6 +19,7 @@ from models.fixmatch.fixmatch import FixMatch
 from datasets.ssl_dataset import SSL_Dataset, ImageNetLoader
 from datasets.data_utils import get_data_loader
 
+import pdb
 
 def main(args):
     '''
@@ -77,7 +79,7 @@ def main_worker(gpu, ngpus_per_node, args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     cudnn.deterministic = True
-
+    
     # SET UP FOR DISTRIBUTED TRAINING
     if args.distributed:
         if args.dist_url == "env://" and args.rank == -1:
@@ -148,7 +150,7 @@ def main_worker(gpu, ngpus_per_node, args):
             torch.cuda.set_device(args.gpu)
 
             '''
-            batch_size: batch_size per node -> batch_size per gpu
+            batch_size: batch_sizsse per node -> batch_size per gpu
             workers: workers per node -> workers per gpu
             '''
             args.batch_size = int(args.batch_size / ngpus_per_node)
@@ -192,7 +194,7 @@ def main_worker(gpu, ngpus_per_node, args):
         lb_dset = image_loader.get_lb_train_data()
         ulb_dset = image_loader.get_ulb_train_data()
         eval_dset = image_loader.get_lb_test_data()
-                            
+               
     loader_dict = {}
     dset_dict = {'train_lb': lb_dset, 'train_ulb': ulb_dset, 'eval': eval_dset}
 
@@ -201,26 +203,29 @@ def main_worker(gpu, ngpus_per_node, args):
                                               data_sampler=args.train_sampler,
                                               num_iters=args.num_train_iter,
                                               num_workers=args.num_workers,
-                                              distributed=args.distributed)
+                                              distributed=args.distributed,
+                                              rank=args.rank)
 
     loader_dict['train_ulb'] = get_data_loader(dset_dict['train_ulb'],
                                                args.batch_size * args.uratio,
                                                data_sampler=args.train_sampler,
                                                num_iters=args.num_train_iter,
-                                               num_workers=4 * args.num_workers,
-                                               distributed=args.distributed)
-
+                                               num_workers=8 * args.num_workers,
+                                               distributed=args.distributed,
+                                               rank=args.rank)
+    
     loader_dict['eval'] = get_data_loader(dset_dict['eval'],
                                           args.eval_batch_size,
                                           num_workers=args.num_workers,
                                           drop_last=False)
-
+                                          
     ## set DataLoader on FixMatch
     model.set_data_loader(loader_dict)
     model.set_dset(ulb_dset)
     # If args.resume, load checkpoints from args.load_path
     if args.resume:
         model.load_model(args.load_path)
+
 
     # START TRAINING of FixMatch
     trainer = model.train

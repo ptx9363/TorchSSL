@@ -182,7 +182,8 @@ def get_transform(mean, std, crop_size, train=True):
         return transforms.Compose([transforms.RandomHorizontalFlip(),
                                    transforms.RandomCrop(crop_size, padding=4, padding_mode='reflect'),
                                    transforms.ToTensor(),
-                                   transforms.Normalize(mean, std)])
+                                   transforms.Normalize(mean, std)
+                                   ])
     else:
         return transforms.Compose([transforms.ToTensor(),
                                    transforms.Normalize(mean, std)])
@@ -331,6 +332,5 @@ class SSL_Dataset:
 
         ulb_dset = BasicDataset(self.alg, ulb_data, ulb_targets, self.num_classes,
                                 self.transform, True, strong_transform, onehot)
-        # print(lb_data.shape)
-        # print(ulb_data.shape)
+
         return lb_dset, ulb_dset

@@ -1,4 +1,6 @@
 import pickle
+import time
+import datetime
 
 import torch
 import numpy as np
@@ -18,8 +20,11 @@ from train_utils import ce_loss, wd_loss, EMA, Bn_Controller
 from sklearn.metrics import *
 from copy import deepcopy
 
+from timm.utils import AverageMeter
+
 
 class FixMatch:
+
     def __init__(self, net_builder, num_classes, ema_m, T, p_cutoff, lambda_u, \
                  hard_label=True, t_fn=None, p_fn=None, it=0, num_eval_iter=1000, tb_log=None, logger=None):
         """
@@ -68,6 +73,7 @@ class FixMatch:
         self.clsacc = [[] for i in range(10)]
         self.logger = logger
         self.print_fn = print if logger is None else logger.info
+        self.print_freq = 10
 
         self.bn_controller = Bn_Controller()
 
@@ -83,7 +89,6 @@ class FixMatch:
         self.scheduler = scheduler
 
     def train(self, args, logger=None):
-
         ngpus_per_node = torch.cuda.device_count()
 
         # EMA Init
@@ -105,22 +110,46 @@ class FixMatch:
         scaler = GradScaler()
         amp_cm = autocast if args.amp else contextlib.nullcontext
 
+        batch_time = AverageMeter()
+        cnn_time = AverageMeter()
+        debug_time = AverageMeter()
+
         # eval for once to verify if the checkpoint is loaded correctly
         if args.resume == True:
             eval_dict = self.evaluate(args=args)
             print(eval_dict)
 
-        selected_label = torch.ones((len(self.ulb_dset),), dtype=torch.long, ) * -1
+        selected_label = torch.ones(
+            (len(self.ulb_dset),),
+            dtype=torch.long,
+        ) * -1
         selected_label = selected_label.cuda(args.gpu)
 
         classwise_acc = torch.zeros((args.num_classes,)).cuda(args.gpu)
 
-        for (_, x_lb, y_lb), (x_ulb_idx, x_ulb_w, x_ulb_s) in zip(self.loader_dict['train_lb'],
-                                                                  self.loader_dict['train_ulb']):
+        train_lb_iter = iter(self.loader_dict['train_lb'])
+        train_ulb_iter = iter(self.loader_dict['train_ulb'])
+        
+        for _iteration in range(args.num_train_iter):
+            batch_start = time.time()
 
-            # prevent the training iterations exceed args.num_train_iter
-            if self.it > args.num_train_iter:
-                break
+            debug_start = time.time()
+            # get data
+            try:
+                _, x_lb, y_lb = train_lb_iter.next()
+            except StopIteration:
+                train_lb_iter = iter(self.loader_dict['train_lb'])
+                _, x_lb, y_lb = train_lb_iter.next()
+
+            try:
+                x_ulb_idx, x_ulb_w, x_ulb_s = train_ulb_iter.next()
+            except StopIteration:
+                train_ulb_iter = iter(self.loader_dict['train_ulb'])
+                x_ulb_idx, x_ulb_w, x_ulb_s = train_ulb_iter.next()
+
+            debug_time.update(time.time() - debug_start)
+
+            self.it = _iteration
 
             end_batch.record()
             torch.cuda.synchronize()
@@ -130,16 +159,22 @@ class FixMatch:
             num_ulb = x_ulb_w.shape[0]
             assert num_ulb == x_ulb_s.shape[0]
 
-            x_lb, x_ulb_w, x_ulb_s = x_lb.cuda(args.gpu), x_ulb_w.cuda(args.gpu), x_ulb_s.cuda(args.gpu)
+
+            x_lb, x_ulb_w, x_ulb_s = x_lb.cuda(args.gpu), x_ulb_w.cuda(
+                args.gpu), x_ulb_s.cuda(args.gpu)
             y_lb = y_lb.cuda(args.gpu)
 
+
             pseudo_counter = Counter(selected_label.tolist())
-            if max(pseudo_counter.values()) < len(self.ulb_dset):  # not all(5w) -1
+            if max(pseudo_counter.values()) < len(
+                    self.ulb_dset):  # not all(5w) -1
                 for i in range(args.num_classes):
-                    classwise_acc[i] = pseudo_counter[i] / max(pseudo_counter.values())
+                    classwise_acc[i] = pseudo_counter[i] / max(
+                        pseudo_counter.values())
 
             inputs = torch.cat((x_lb, x_ulb_w, x_ulb_s))
 
+            cnn_start = time.time()
             # inference and calculate sup/unsup losses
             with amp_cm():
                 logits = self.model(inputs)
@@ -151,10 +186,13 @@ class FixMatch:
                 T = self.t_fn(self.it)
                 p_cutoff = self.p_fn(self.it)
 
-                unsup_loss, mask, select, pseudo_lb = consistency_loss(logits_x_ulb_s,
-                                                                       logits_x_ulb_w,
-                                                                       'ce', T, p_cutoff,
-                                                                       use_hard_labels=args.hard_label)
+                unsup_loss, mask, select, pseudo_lb = consistency_loss(
+                    logits_x_ulb_s,
+                    logits_x_ulb_w,
+                    'ce',
+                    T,
+                    p_cutoff,
+                    use_hard_labels=args.hard_label)
 
                 total_loss = sup_loss + self.lambda_u * unsup_loss
 
@@ -162,18 +200,22 @@ class FixMatch:
             if args.amp:
                 scaler.scale(total_loss).backward()
                 if (args.clip > 0):
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), args.clip)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(),
+                                                   args.clip)
                 scaler.step(self.optimizer)
                 scaler.update()
             else:
                 total_loss.backward()
                 if (args.clip > 0):
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), args.clip)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(),
+                                                   args.clip)
                 self.optimizer.step()
 
             self.scheduler.step()
             self.ema.update()
             self.model.zero_grad()
+
+            cnn_time.update(time.time() - cnn_start)
 
             end_run.record()
             torch.cuda.synchronize()
@@ -185,7 +227,8 @@ class FixMatch:
             tb_dict['train/total_loss'] = total_loss.detach()
             tb_dict['train/mask_ratio'] = 1.0 - mask.detach()
             tb_dict['lr'] = self.optimizer.param_groups[0]['lr']
-            tb_dict['train/prefecth_time'] = start_batch.elapsed_time(end_batch) / 1000.
+            tb_dict['train/prefetch_time'] = start_batch.elapsed_time(
+                end_batch) / 1000.
             tb_dict['train/run_time'] = start_run.elapsed_time(end_run) / 1000.
 
             # Save model for each 10K steps and best model for each 1K steps
@@ -206,7 +249,8 @@ class FixMatch:
                     best_it = self.it
 
                 self.print_fn(
-                    f"{self.it} iteration, USE_EMA: {self.ema_m != 0}, {tb_dict}, BEST_EVAL_ACC: {best_eval_acc}, at {best_it} iters")
+                    f"{self.it} iteration, USE_EMA: {self.ema_m != 0}, {tb_dict}, BEST_EVAL_ACC: {best_eval_acc}, at {best_it} iters"
+                )
 
                 if not args.multiprocessing_distributed or \
                         (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
@@ -217,14 +261,31 @@ class FixMatch:
                     if not self.tb_log is None:
                         self.tb_log.update(tb_dict, self.it)
 
-            self.it += 1
+            batch_time.update(time.time() - batch_start)
+            if self.it % self.print_freq == 0:
+                etas = batch_time.avg * (args.num_train_iter - self.it)
+                self.print_fn(
+                    f"Train: [{self.it}]\t"
+                    f'eta {datetime.timedelta(seconds=int(etas))}\t'
+                    f"sup_loss {tb_dict['train/sup_loss']:.04f} \t"
+                    f"unsup_loss {tb_dict['train/unsup_loss']:.04f} \t"
+                    f"total_loss {tb_dict['train/total_loss']:.04f} \t"
+                    f"lr {tb_dict['lr']:.04f} \t"
+                    f'batch_time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
+                    f'cnn_time {cnn_time.val:.4f} ({cnn_time.avg:.4f})\t'
+                    f'debug_time {debug_time.val:.4f} ({debug_time.avg:.4f})\t'
+                )
+
             del tb_dict
             start_batch.record()
             if self.it > 0.8 * args.num_train_iter:
                 self.num_eval_iter = 1000
 
         eval_dict = self.evaluate(args=args)
-        eval_dict.update({'eval/best_acc': best_eval_acc, 'eval/best_it': best_it})
+        eval_dict.update({
+            'eval/best_acc': best_eval_acc,
+            'eval/best_it': best_it
+        })
         return eval_dict
 
     @torch.no_grad()
@@ -259,8 +320,15 @@ class FixMatch:
         self.print_fn('confusion matrix:\n' + np.array_str(cf_mat))
         self.ema.restore()
         self.model.train()
-        return {'eval/loss': total_loss / total_num, 'eval/top-1-acc': top1, 'eval/top-5-acc': top5,
-                'eval/precision': precision, 'eval/recall': recall, 'eval/F1': F1, 'eval/AUC': AUC}
+        return {
+            'eval/loss': total_loss / total_num,
+            'eval/top-1-acc': top1,
+            'eval/top-5-acc': top5,
+            'eval/precision': precision,
+            'eval/recall': recall,
+            'eval/F1': F1,
+            'eval/AUC': AUC
+        }
 
     def save_model(self, save_name, save_path):
         # if self.it < 1000000:
@@ -273,21 +341,26 @@ class FixMatch:
         self.ema.restore()
         self.model.train()
 
-        torch.save({'model': self.model.state_dict(),
-                    'optimizer': self.optimizer.state_dict(),
-                    'scheduler': self.scheduler.state_dict(),
-                    'it': self.it,
-                    'ema_model': ema_model},
-                   save_filename)
+        torch.save(
+            {
+                'model': self.model.state_dict(),
+                'optimizer': self.optimizer.state_dict(),
+                'scheduler': self.scheduler.state_dict(),
+                'it': self.it,
+                'ema_model': ema_model
+            }, save_filename)
         if self.num_classes == 10:
             tb_path = os.path.join(save_path, 'tensorboard')
             if not os.path.exists(tb_path):
                 os.makedirs(tb_path, exist_ok=True)
-            with open(os.path.join(save_path, 'tensorboard', 'lst_fix.pkl'), 'wb') as f:
+            with open(os.path.join(save_path, 'tensorboard', 'lst_fix.pkl'),
+                      'wb') as f:
                 pickle.dump(self.lst, f)
-            with open(os.path.join(save_path, 'tensorboard', 'abs_lst.pkl'), 'wb') as h:
+            with open(os.path.join(save_path, 'tensorboard', 'abs_lst.pkl'),
+                      'wb') as h:
                 pickle.dump(self.abs_lst, h)
-            with open(os.path.join(save_path, 'tensorboard', 'clsacc.pkl'), 'wb') as g:
+            with open(os.path.join(save_path, 'tensorboard', 'clsacc.pkl'),
+                      'wb') as g:
                 pickle.dump(self.clsacc, g)
         self.print_fn(f"model saved: {save_filename}")
 
